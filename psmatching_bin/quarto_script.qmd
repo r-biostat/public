@@ -1,0 +1,128 @@
+---
+title: "傾向スコアマッチングを用いた喫煙と低体重児の関連の解析"
+format: 
+  html:
+    self-contained: true
+    toc: true
+    number-sections: true
+    theme: cosmo
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## はじめに
+
+本レポートでは、MASSパッケージのbirthwtデータセットを用いて、喫煙が低体重児出産に与える影響を傾向スコアマッチングを用いて解析します。
+
+## 解析手順
+
+### 手順1: データの読み込み
+
+MASSパッケージからbirthwtデータを読み込み、dfに格納します。
+
+```{r}
+#| label: setup
+library(MASS)
+library(dplyr)
+library(MatchIt)
+library(geepack)
+library(broom)
+library(tableone)
+library(knitr)
+library(kableExtra)
+
+# データの読み込み
+data(birthwt)
+df <- birthwt
+```
+
+### 手順2: カテゴリカル変数の変換
+
+raceをカテゴリカル変数に変換します。
+
+```{r}
+#| label: data-prep
+# raceを因子型に変換
+df$race <- factor(df$race, 
+                 levels = 1:3,
+                 labels = c("White", "Black", "Other"))
+```
+
+### 手順3: 傾向スコアマッチング
+
+matchit関数を用いて傾向スコアマッチングを実施します。
+
+```{r}
+#| label: ps-matching
+# 傾向スコアマッチングの実行
+m.out <- matchit(smoke ~ age + lwt + race + ptl + ht + ui + ftv,
+                data = df,
+                method = "nearest",
+                caliper = 0.2,
+                link = "linear.logit")
+
+# マッチング後のデータセットを取得
+df_matched <- match.data(m.out)
+```
+
+### 手順4: マッチング前後の患者背景表
+
+マッチング前後の患者背景を比較します。
+
+```{r}
+#| label: balance-table
+# マッチング前の変数リスト
+vars <- c("age", "lwt", "race", "ptl", "ht", "ui", "ftv")
+
+# マッチング前の比較表
+tab_pre <- CreateTableOne(vars = vars,
+                         strata = "smoke",
+                         data = df,
+                         smd = TRUE)
+
+# マッチング後の比較表
+tab_post <- CreateTableOne(vars = vars,
+                          strata = "smoke",
+                          data = df_matched,
+                          smd = TRUE)
+
+# 結果の表示
+print("マッチング前の患者背景:")
+print(tab_pre, smd = TRUE)
+
+print("\nマッチング後の患者背景:")
+print(tab_post, smd = TRUE)
+```
+
+### 手順5: GEEモデルの構築
+
+マッチング後のコホートを用いて、GEEモデルを構築します。
+
+```{r}
+#| label: gee-model
+# GEEモデルの構築
+gee_model <- geeglm(low ~ smoke,
+                    data = df_matched,
+                    family = binomial(link = "identity"),
+                    id = subclass,
+                    corstr = "independence")
+```
+
+### 手順6: モデル結果のサマリ
+
+```{r}
+#| label: model-summary
+# モデル結果のサマリ
+model_summary <- tidy(gee_model, conf.int = TRUE)
+kable(model_summary,
+      caption = "GEEモデルの結果",
+      digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## 結論
+
+以上の解析により、傾向スコアマッチング後の喫煙が低体重児出産に与える影響を推定しました。 
