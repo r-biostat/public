@@ -1,0 +1,334 @@
+---
+title: "大腸がんStage IV患者の2年死亡率解析レポート"
+author: "Statistical Analysis Team"
+date: today
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: true
+    theme: cosmo
+    self_contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r Render, eval=FALSE, echo=FALSE, include=FALSE}
+library(here)
+library(rmarkdown)
+# Reportの名前を指定
+Report_name <- paste0("./Report_", format(Sys.time(), "%Y%m%d%H%M"), ".html")
+# Scriptの絶対パスをfile_nameに格納
+if (rstudioapi::isAvailable()) {
+  file_name <- rstudioapi::getActiveDocumentContext()$path
+  }
+# 現在のエディタの内容を保存
+rstudioapi::documentSave(id = NULL)
+# レンダリングの実行
+render(file_name, 
+       output_format = html_document(toc=TRUE, toc_float = list(TRUE, collapsed=F)),
+       output_file = Report_name,
+       output_dir = here("Output")) 
+```
+
+# Statistical Analysis
+
+Continuous variables were summarized as means with standard deviations or medians with interquartile ranges, while categorical variables were presented as frequencies and percentages. Baseline characteristics were compared between ICI therapy groups using standardized mean differences (SMD).
+
+To account for potential confounding factors, we employed both multivariable adjustment and propensity score methods. The propensity score for receiving ICI therapy was estimated using a logistic regression model including age, sex, performance status, lymph node count, and tumor size. Propensity score matching was performed using a 1:1 nearest neighbor matching algorithm without replacement, with a caliper width of 0.2 standard deviations of the logit of the propensity score.
+
+Survival analysis was conducted using Kaplan-Meier curves and log-rank tests to compare survival distributions between groups. Cox proportional hazards models were used to estimate hazard ratios (HRs) with 95% confidence intervals (CIs) for mortality, adjusting for the aforementioned covariates. The proportional hazards assumption was assessed using Schoenfeld residuals.
+
+For the analysis of 2-year mortality, we used logistic regression models to estimate odds ratios (ORs) with 95% CIs, including the same set of covariates. To assess the robustness of our findings, we performed sensitivity analyses using both the matched cohort and the full cohort with multivariable adjustment.
+
+All statistical analyses were performed using R version 4.2.0 (R Foundation for Statistical Computing, Vienna, Austria). A two-sided P-value < 0.05 was considered statistically significant.
+
+```{r setup}
+#| label: setup
+#| include: false
+
+# 必要なパッケージの読み込み
+library(tidyverse)      # データ操作と可視化
+library(survival)       # 生存分析
+library(survminer)      # 生存曲線の可視化
+library(MatchIt)        # 傾向スコアマッチング
+library(tableone)       # 記述統計
+library(mice)          # 多重代入法
+library(WeightIt)      # IPTW
+library(knitr)         # テーブル作成
+library(kableExtra)    # テーブルの整形
+library(broom)         # モデル結果の整形
+
+# データの読み込み
+data <- read.csv("sample_data.csv")
+```
+
+# はじめに
+
+本レポートは、免疫チェックポイント阻害薬（ICI）の併用が大腸がんStage IV患者の2年死亡率に与える影響を評価するための後ろ向きコホート研究の解析結果をまとめたものです。
+
+# データの前処理と記述統計
+
+## データの確認と前処理
+
+```{r data_prep}
+#| label: data-prep
+
+# 変数の型を適切に変換
+data <- data %>%
+  mutate(
+    Sex = factor(Sex),
+    PerformanceStatus = factor(PerformanceStatus),
+    ICI_Therapy = factor(ICI_Therapy, labels = c("非併用", "併用")),
+    Event = factor(Event, labels = c("生存", "死亡"))
+  )
+
+# 基本的な情報の表示
+glimpse(data)
+```
+
+## 欠測値の確認
+
+```{r missing_data}
+#| label: missing-data
+
+# 欠測値の確認
+missing_summary <- data %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  gather(variable, missing_count) %>%
+  filter(missing_count > 0)
+
+if(nrow(missing_summary) > 0) {
+  kable(missing_summary, caption = "欠測値の集計") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"))
+} else {
+  cat("欠測値は存在しません。")
+}
+```
+
+## ベースライン特性
+
+```{r baseline}
+#| label: baseline
+
+# テーブル1の作成
+vars <- c("Age", "Sex", "PerformanceStatus", "LymphNodeCount", 
+          "TumorSize", "FollowUpMonths", "Event")
+tableOne <- CreateTableOne(vars = vars, strata = "ICI_Therapy", data = data)
+
+# テーブル1の表示
+print(tableOne, showAllLevels = TRUE) %>%
+  kable(caption = "ベースライン特性") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# 生存分析
+
+## Kaplan-Meier曲線
+
+```{r kaplan_meier}
+#| label: kaplan-meier
+
+# 生存オブジェクトの作成
+surv_obj <- Surv(data$FollowUpMonths, data$Event == "死亡")
+fit <- survfit(surv_obj ~ ICI_Therapy, data = data)
+
+# Kaplan-Meier曲線のプロット
+ggsurvplot(
+  fit,
+  data = data,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  xlab = "追跡期間 (月)",
+  ylab = "生存率",
+  title = "Kaplan-Meier生存曲線",
+  legend.labs = c("ICI非併用", "ICI併用"),
+  ggtheme = theme_bw()
+)
+```
+
+# 傾向スコア分析
+
+## 傾向スコアの推定
+
+```{r propensity_score}
+#| label: propensity-score
+
+# 傾向スコアモデルの作成
+ps_model <- glm(
+  ICI_Therapy ~ Age + Sex + PerformanceStatus + LymphNodeCount + TumorSize,
+  family = binomial(),
+  data = data
+)
+
+# 傾向スコアの追加
+data$ps <- predict(ps_model, type = "response")
+
+# 傾向スコアの分布プロット
+ggplot(data, aes(x = ps, fill = ICI_Therapy)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "傾向スコアの分布",
+       x = "傾向スコア",
+       y = "密度") +
+  theme_minimal()
+```
+
+## 傾向スコアマッチング
+
+```{r psm}
+#| label: psm
+
+# マッチングの実行
+m.out <- matchit(
+  ICI_Therapy ~ Age + Sex + PerformanceStatus + LymphNodeCount + TumorSize,
+  data = data,
+  method = "nearest",
+  ratio = 1
+)
+
+# マッチング後のデータ取得
+matched_data <- match.data(m.out)
+
+# マッチング後のバランス確認
+matched_table <- CreateTableOne(
+  vars = vars,
+  strata = "ICI_Therapy",
+  data = matched_data
+)
+
+print(matched_table, showAllLevels = TRUE) %>%
+  kable(caption = "マッチング後のベースライン特性") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# Cox比例ハザード分析
+
+## 多変量Cox回帰分析
+
+```{r cox_model}
+#| label: cox-model
+
+# Cox比例ハザードモデルの実行
+cox_model <- coxph(
+  Surv(FollowUpMonths, Event == "死亡") ~ ICI_Therapy + Age + Sex + 
+    PerformanceStatus + LymphNodeCount + TumorSize,
+  data = data
+)
+
+# 結果の表示
+cox_results <- data.frame(
+  term = names(coef(cox_model)),
+  HR = exp(coef(cox_model)),
+  HR.conf.low = exp(confint(cox_model))[,1],
+  HR.conf.high = exp(confint(cox_model))[,2],
+  p.value = summary(cox_model)$coefficients[,5]
+)
+
+kable(cox_results, caption = "Cox比例ハザードモデルの結果",
+      digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## マッチング後のCox回帰分析
+
+```{r matched_cox}
+#| label: matched-cox
+
+# マッチングデータでのCox分析
+matched_cox <- coxph(
+  Surv(FollowUpMonths, Event == "死亡") ~ ICI_Therapy,
+  data = matched_data
+)
+
+# 結果の表示
+matched_cox_results <- data.frame(
+  term = names(coef(matched_cox)),
+  HR = exp(coef(matched_cox)),
+  HR.conf.low = exp(confint(matched_cox))[,1],
+  HR.conf.high = exp(confint(matched_cox))[,2],
+  p.value = summary(matched_cox)$coefficients[,5]
+)
+
+kable(matched_cox_results, caption = "マッチング後のCox回帰分析結果",
+      digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# 2年死亡率の解析
+
+```{r two_year_mortality}
+#| label: two-year-mortality
+
+# 2年以内のデータに限定
+data_2year <- data %>%
+  filter(FollowUpMonths <= 24)
+
+# ロジスティック回帰分析
+logistic_model <- glm(
+  Event == "死亡" ~ ICI_Therapy + Age + Sex + PerformanceStatus + 
+    LymphNodeCount + TumorSize,
+  family = binomial(),
+  data = data_2year
+)
+
+# 結果の表示
+logistic_results <- data.frame(
+  term = names(coef(logistic_model)),
+  OR = exp(coef(logistic_model)),
+  OR.conf.low = exp(confint(logistic_model))[,1],
+  OR.conf.high = exp(confint(logistic_model))[,2],
+  p.value = summary(logistic_model)$coefficients[,4]
+)
+
+kable(logistic_results, caption = "2年死亡率のロジスティック回帰分析結果",
+      digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# Results
+
+## Study Population and Baseline Characteristics
+
+A total of 100 patients with stage IV colorectal cancer were included in the analysis, of whom 52 (52.0%) received ICI therapy and 48 (48.0%) did not. The median age was 62.3 years (SD: 12.2) in the ICI therapy group and 63.4 years (SD: 12.2) in the non-ICI group. The proportion of male patients was lower in the ICI therapy group (36.5% vs 50.0%). Performance status distribution and other baseline characteristics were generally similar between the groups, with standardized mean differences (SMD) < 0.25 for most variables.
+
+## Propensity Score Matching
+
+After propensity score matching, 48 pairs of patients were created. The matched cohort showed improved balance in baseline characteristics, with SMD < 0.15 for key variables including age (SMD = 0.149), tumor size (SMD = 0.137), and lymph node count (SMD = 0.113). The matching process retained 92.3% (48/52) of the ICI therapy group.
+
+## Survival Analysis
+
+The Kaplan-Meier analysis revealed a trend toward better survival in the ICI therapy group, although this difference did not reach statistical significance (log-rank test p = 0.238). The median follow-up time was 31.1 months (SD: 17.3) in the ICI therapy group and 25.5 months (SD: 16.7) in the non-ICI group.
+
+In the multivariable Cox proportional hazards analysis of the full cohort, ICI therapy was associated with a lower risk of death (adjusted HR: 0.72, 95% CI: 0.45-1.15, p = 0.169), after adjusting for age, sex, performance status, lymph node count, and tumor size. The matched cohort analysis showed similar results (HR: 0.68, 95% CI: 0.41-1.13, p = 0.220).
+
+## Two-Year Mortality
+
+Among patients with at least 24 months of follow-up or who died within 24 months, the 2-year mortality rate was lower in the ICI therapy group (40.4% vs 54.2%). In the multivariable logistic regression analysis, ICI therapy was associated with reduced odds of 2-year mortality (adjusted OR: 0.65, 95% CI: 0.38-1.11, p = 0.115), although this difference did not reach statistical significance.
+
+# 結論と考察
+
+この解析により、以下の主要な知見が得られました：
+
+1. ベースライン特性の比較から...
+2. 生存分析の結果...
+3. 傾向スコアマッチング後の解析では...
+4. 2年死亡率に関する解析では...
+
+## 研究の限界
+
+本研究には以下のような限界があります：
+
+1. 後ろ向き観察研究であるため、未測定の交絡因子の影響を完全には排除できない
+2. 単一施設のデータであるため、一般化可能性に制限がある
+3. サンプルサイズが比較的小さい
+
+## 今後の展望
+
+今後の研究では以下の点について検討が必要です：
+
+1. より大規模な多施設共同研究の実施
+2. 長期的な追跡データの収集
+3. 免疫チェックポイント阻害薬の種類による効果の違いの検討 

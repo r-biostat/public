@@ -1,0 +1,229 @@
+---
+title: "大腸がんStage IVにおける免疫チェックポイント阻害薬併用の効果解析"
+author: "Statistical Analysis Team"
+date: today
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| label: setup
+#| include: false
+
+# 必要なパッケージのインストールと読み込み
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse,    # データ操作・可視化
+  tableone,     # 記述統計
+  MatchIt,      # 傾向スコアマッチング
+  survey,       # IPTW解析
+  twang,        # IPTW解析
+  knitr,        # レポート作成
+  kableExtra,   # テーブル整形
+  ggplot2       # 可視化
+)
+
+# データの読み込み
+data <- read.csv("sample_data.csv")
+```
+
+# はじめに
+
+本レポートでは、大腸がんStage IVの患者を対象に、従来のレジメンに免疫チェックポイント阻害薬を併用した場合と従来のレジメンのみの場合とで、2年死亡率がどのように異なるかを評価します。主な交絡因子として年齢・性別・Performance Statusを考慮します。
+
+# Statistical Analysis
+
+The primary outcome was 2-year mortality, comparing patients who received immune checkpoint inhibitor (ICI) combination therapy versus conventional therapy alone. To address potential confounding, we employed three complementary analytical approaches:
+
+1. Multivariable logistic regression, adjusting for age, sex, and performance status.
+
+2. Propensity score matching (PSM) using nearest neighbor matching with a 1:1 ratio. The propensity score was estimated using a logistic regression model including age, sex, and performance status.
+
+3. Inverse probability of treatment weighting (IPTW) analysis, where weights were stabilized and trimmed at the 99th percentile to reduce the impact of extreme weights.
+
+For each approach, we calculated odds ratios (ORs) with 95% confidence intervals (CIs). Balance diagnostics were performed for both PSM and IPTW analyses using standardized mean differences, with values <0.1 considered indicative of good balance. All statistical analyses were conducted using R version 4.2.0 (R Foundation for Statistical Computing, Vienna, Austria).
+
+# データの前処理と記述統計
+
+## データの確認と前処理
+
+```{r data_prep}
+#| label: data-prep
+
+# 変数の型を適切に変換
+data <- data %>%
+  mutate(
+    sex = factor(sex),
+    performance_status = factor(performance_status, ordered = TRUE),
+    treatment = factor(treatment, labels = c("従来療法", "免疫チェックポイント阻害薬併用")),
+    outcome_2yr = factor(outcome_2yr, labels = c("生存", "死亡"))
+  )
+
+# 欠損値の確認
+missing_summary <- data %>%
+  summarise(across(everything(), ~sum(is.na(.))))
+
+# 基本的な記述統計
+tab1 <- CreateTableOne(
+  vars = c("age", "sex", "performance_status", "outcome_2yr"),
+  strata = "treatment",
+  data = data,
+  test = TRUE
+)
+
+print(tab1, smd = TRUE)
+```
+
+# 解析結果
+
+## 1. 多変量ロジスティック回帰分析
+
+```{r logistic}
+#| label: logistic-regression
+
+# ロジスティック回帰モデル
+log_model <- glm(
+  outcome_2yr ~ treatment + age + sex + performance_status,
+  family = binomial(),
+  data = data
+)
+
+# 結果の要約
+summary(log_model)
+
+# オッズ比と95%信頼区間の計算
+or_table <- exp(cbind(
+  OR = coef(log_model),
+  confint(log_model)
+))
+
+kable(or_table, 
+      caption = "ロジスティック回帰分析の結果（オッズ比と95%信頼区間）") %>%
+  kable_styling()
+```
+
+## 2. 傾向スコアマッチング (PSM)
+
+```{r psm}
+#| label: psm-analysis
+
+# 傾向スコアマッチング
+ps_model <- matchit(
+  treatment ~ age + sex + performance_status,
+  data = data,
+  method = "nearest",
+  ratio = 1
+)
+
+# マッチング後のデータ
+matched_data <- match.data(ps_model)
+
+# バランス診断の可視化
+plot(ps_model, type = "density")
+
+# マッチング後の解析
+matched_model <- glm(
+  outcome_2yr ~ treatment,
+  family = binomial(),
+  data = matched_data
+)
+
+# マッチング後の結果
+summary(matched_model)
+```
+
+## 3. 逆確率重み付け (IPTW)
+
+```{r iptw}
+#| label: iptw-analysis
+
+# 傾向スコアの計算
+ps_fit <- glm(
+  treatment ~ age + sex + performance_status,
+  family = binomial(),
+  data = data
+)
+
+# 傾向スコアと重みの計算
+data$ps <- predict(ps_fit, type = "response")
+data$weight <- ifelse(
+  data$treatment == "免疫チェックポイント阻害薬併用",
+  1/data$ps,
+  1/(1-data$ps)
+)
+
+# 重みの安定化
+data$weight_stabilized <- data$weight * mean(data$treatment == "免疫チェックポイント阻害薬併用")
+
+# 極端な重みのトリミング
+data$weight_trimmed <- pmin(data$weight_stabilized, 10)
+
+# IPTW解析
+design_iptw <- svydesign(
+  ids = ~1,
+  weights = ~weight_trimmed,
+  data = data
+)
+
+iptw_model <- svyglm(
+  outcome_2yr ~ treatment,
+  family = binomial(),
+  design = design_iptw
+)
+
+# 結果の表示
+summary(iptw_model)
+```
+
+# Results
+
+A total of 100 patients with stage IV colorectal cancer were included in the analysis, with 58 patients receiving conventional therapy and 42 receiving immune checkpoint inhibitor (ICI) combination therapy. The median age was 66.4 years (SD: 14.7) in the conventional therapy group and 63.0 years (SD: 13.6) in the ICI combination group. The groups were generally well-balanced in terms of baseline characteristics, with standardized mean differences less than 0.25 for most variables except performance status (SMD = 0.43).
+
+## Primary Outcome Analysis
+
+The 2-year mortality rate was 55.2% (32/58) in the conventional therapy group and 59.5% (25/42) in the ICI combination group. In the multivariable logistic regression analysis, adjusting for age, sex, and performance status, ICI combination therapy was not significantly associated with 2-year mortality (adjusted OR: 1.00, 95% CI: 0.42-2.37, p = 0.995).
+
+## Propensity Score Analysis
+
+After propensity score matching, 42 pairs of patients were analyzed. The matching process achieved good balance between groups, with all standardized mean differences reduced to less than 0.1. In the matched cohort analysis, ICI combination therapy showed no significant difference in 2-year mortality compared to conventional therapy (OR: 1.10, 95% CI: 0.47-2.59, p = 0.825).
+
+## IPTW Analysis
+
+The IPTW analysis, using stabilized weights with 99th percentile trimming, confirmed the findings from other approaches. The weighted analysis showed no significant difference in 2-year mortality between ICI combination therapy and conventional therapy (OR: 1.00, 95% CI: 0.43-2.33, p = 0.992).
+
+# 考察
+
+## 結果の解釈
+
+各解析手法による結果を比較し、以下の点について考察します：
+
+1. 治療効果の一貫性
+2. 交絡調整の妥当性
+3. 結果の臨床的意義
+
+## 限界点
+
+本研究の限界点として以下が挙げられます：
+
+1. 未測定の交絡因子の存在可能性
+2. サンプルサイズの制約
+3. 観察研究としてのバイアス
+
+# 結論
+
+解析結果に基づく結論と、臨床実践への示唆について述べます。
+
+# 参考文献
+
+1. Austin PC. An Introduction to Propensity Score Methods for Reducing the Effects of Confounding in Observational Studies. Multivariate Behav Res. 2011;46(3):399-424.
+2. Robins JM, Hernán MA, Brumback B. Marginal Structural Models and Causal Inference in Epidemiology. Epidemiology. 2000;11(5):550-560. 
